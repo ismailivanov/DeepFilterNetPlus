@@ -575,8 +575,8 @@ impl DfDbusControl {
 }
 
 #[unsafe(no_mangle)]
-pub fn get_ladspa_descriptor(index: u64) -> PluginDescriptor {
-    match index {
+pub fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> {
+    let descriptor = match index {
         0 => PluginDescriptor {
             unique_id: ID_MONO,
             label: "deep_filter_mono",
@@ -726,7 +726,9 @@ pub fn get_ladspa_descriptor(index: u64) -> PluginDescriptor {
             new: |d, sr| Box::new(get_new_df(2)(d, sr)),
         },
         _ => {
-            panic!("Unexpected plugin index: {index}");
+            log::error!("Unexpected plugin index: {index}");
+            return None;
         }
-    }
+    };
+    Some(descriptor)
 }
