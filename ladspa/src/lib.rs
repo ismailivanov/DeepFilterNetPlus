@@ -4,10 +4,10 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{
-    mpsc::{sync_channel, Receiver, SyncSender},
     Arc, Mutex, Once,
+    mpsc::{Receiver, SyncSender, sync_channel},
 };
-use std::thread::{self, sleep, JoinHandle};
+use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 use df::tract::*;
@@ -73,14 +73,10 @@ thread_local! {
     static MODEL: RefCell<DfTract> = RefCell::new({
         let channels = CHANNELS.load(Ordering::Acquire);
         if channels == 0 {
-            log::error!("Channels wasn't initialized!");
             panic!("Channels wasn't initialized!");
         }
-        log::trace!("Initializing default dfparams");
         let df_params = DfParams::default();
-        log::trace!("Initializing runtime params");
         let r_params = RuntimeParams::default_with_ch(channels);
-        log::trace!("Starting dftract");
         DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime")
     });
 }
@@ -189,7 +185,6 @@ fn get_worker_fn(
 
 /// Initialize DF model and returns sample rate and frame size
 fn init_df(channels: usize) -> (usize, usize) {
-    log::trace!("Returning initialized df");
     CHANNELS.store(channels, Ordering::Release);
     MODEL.with_borrow(|model| (model.sr, model.hop_size))
 }
@@ -230,7 +225,6 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
 
         let (control_tx, control_rx) = sync_channel(32);
 
-        log::trace!("Starting df worker function");
         let worker_handle = thread::spawn(get_worker_fn(
             Arc::clone(&i_tx),
             Arc::clone(&o_rx),
@@ -352,7 +346,6 @@ impl Plugin for DfPlugin {
             let init = Arc::new(Event::new());
             let done = Arc::new(Event::new());
             let init_listen = init.listen();
-            log::trace!("Starting dbus worker");
             self._dbus = Some((
                 thread::spawn(get_dbus_worker(
                     self.control_tx.clone(),
@@ -581,9 +574,8 @@ impl DfDbusControl {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn get_ladspa_descriptor(index: u64) -> PluginDescriptor {
-    log::trace!("Getting ladspa descriptor {}", index);
+#[unsafe(no_mangle)]
+pub fn get_ladspa_descriptor(index: u64) -> PluginDescriptor {
     match index {
         0 => PluginDescriptor {
             unique_id: ID_MONO,
@@ -735,6 +727,6 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> PluginDescriptor {
         },
         _ => {
             panic!("Unexpected plugin index: {index}");
-        },
+        }
     }
 }

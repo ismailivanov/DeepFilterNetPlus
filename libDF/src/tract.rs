@@ -35,34 +35,17 @@ impl DfParams {
         Self::from_targz(tar_buf)
     }
     fn from_targz<R: Read>(f: R) -> Result<Self> {
-        log::trace!("Extracting .tar.gz. Creating gz decoder...");
         let tar = GzDecoder::new(f);
-        log::trace!("Creating ar decoder...");
         let mut archive = Archive::new(tar);
         let mut enc = Vec::new();
         let mut erb_dec = Vec::new();
         let mut df_dec = Vec::new();
         let mut config = Ini::new();
-        log::trace!("Iterating through entries...");
         for e in archive.entries().context("Could not extract models from tar file.")? {
             let mut file = e.context("Could not open model tar entry.")?;
-            let path = match file.path() {
-                Ok(val) => val,
-                Err(e) => {
-                    log::error!("Unable to find file path: {}", e);
-                    return Err(e.into());
-                }
-            };
-            log::trace!("Examining {}", path.display());
+            let path = file.path()?;
             if path.ends_with("enc.onnx") {
-                log::trace!("Reading {} to end...", path.display());
-                match file.read_to_end(&mut enc) {
-                    Ok(size) => log::info!("enc.onnx was {} bytes", size),
-                    Err(e) => {
-                        log::error!("Unable to read enc.onnx: {e}");
-                        return Err(e.into());
-                    }
-                }
+                file.read_to_end(&mut enc)?;
             } else if path.ends_with("erb_dec.onnx") {
                 file.read_to_end(&mut erb_dec)?;
             } else if path.ends_with("df_dec.onnx") {
@@ -78,7 +61,6 @@ impl DfParams {
                 log::warn!("Found non-matching item in model tar file: {:?}", path)
             }
         }
-        log::trace!("Finished extracting everything");
         Ok(Self {
             config,
             enc,
@@ -87,6 +69,7 @@ impl DfParams {
         })
     }
 }
+
 impl Default for DfParams {
     fn default() -> Self {
         #[cfg(not(any(feature = "default-model-ll", feature = "default-model")))]
