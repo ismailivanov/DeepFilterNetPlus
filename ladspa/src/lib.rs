@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{
     mpsc::{sync_channel, Receiver, SyncSender},
     Arc, Mutex, Once,
@@ -66,7 +68,22 @@ struct DfPlugin {
 
 const ID_MONO: u64 = 7843795;
 const ID_STEREO: u64 = 7843796;
-static mut MODEL: Option<DfTract> = None;
+static CHANNELS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static MODEL: RefCell<DfTract> = RefCell::new({
+        let channels = CHANNELS.load(Ordering::Acquire);
+        if channels == 0 {
+            log::error!("Channels wasn't initialized!");
+            panic!("Channels wasn't initialized!");
+        }
+        log::trace!("Initializing default dfparams");
+        let df_params = DfParams::default();
+        log::trace!("Initializing runtime params");
+        let r_params = RuntimeParams::default_with_ch(channels);
+        log::trace!("Starting dftract");
+        DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime")
+    });
+}
 
 fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {
     let ts = buf.timestamp_millis();
@@ -111,80 +128,70 @@ fn get_worker_fn(
     id: String,
 ) -> impl FnMut() {
     move || {
-        let mut df = unsafe { MODEL.clone().unwrap() };
-        let mut inframe = Array2::zeros((df.ch, df.hop_size));
-        let mut outframe = Array2::zeros((df.ch, df.hop_size));
-        let t_audio_ms = df.hop_size as f32 / df.sr as f32 * 1000.;
-        loop {
-            if let Ok((c, v)) = controls.try_recv() {
-                log::info!("DF {} | Setting '{}' to {:.1}", id, c, v);
-                match c {
-                    DfControl::AttenLim => df.set_atten_lim(v),
-                    DfControl::PfBeta => df.set_pf_beta(v),
-                    DfControl::MinThreshDb => df.min_db_thresh = v,
-                    DfControl::MaxErbThreshDb => df.max_db_erb_thresh = v,
-                    DfControl::MaxDfThreshDb => df.max_db_df_thresh = v,
-                    _ => (),
+        MODEL.with_borrow_mut(|df| {
+            let mut inframe = Array2::zeros((df.ch, df.hop_size));
+            let mut outframe = Array2::zeros((df.ch, df.hop_size));
+            let t_audio_ms = df.hop_size as f32 / df.sr as f32 * 1000.;
+            loop {
+                if let Ok((c, v)) = controls.try_recv() {
+                    log::info!("DF {} | Setting '{}' to {:.1}", id, c, v);
+                    match c {
+                        DfControl::AttenLim => df.set_atten_lim(v),
+                        DfControl::PfBeta => df.set_pf_beta(v),
+                        DfControl::MinThreshDb => df.min_db_thresh = v,
+                        DfControl::MaxErbThreshDb => df.max_db_erb_thresh = v,
+                        DfControl::MaxDfThreshDb => df.max_db_df_thresh = v,
+                        _ => (),
+                    }
                 }
-            }
-            let got_samples = {
-                let mut q = inqueue.lock().unwrap();
-                if q[0].len() >= df.hop_size {
-                    for (i_q_ch, mut i_ch) in q.iter_mut().zip(inframe.outer_iter_mut()) {
-                        for i in i_ch.iter_mut() {
-                            *i = i_q_ch.pop_front().unwrap();
+                let got_samples = {
+                    let mut q = inqueue.lock().unwrap();
+                    if q[0].len() >= df.hop_size {
+                        for (i_q_ch, mut i_ch) in q.iter_mut().zip(inframe.outer_iter_mut()) {
+                            for i in i_ch.iter_mut() {
+                                *i = i_q_ch.pop_front().unwrap();
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !got_samples {
+                    sleep(sleep_duration);
+                    continue;
+                }
+                let t0 = Instant::now();
+                let lsnr = df
+                    .process(inframe.view(), outframe.view_mut())
+                    .expect("Error during df::process");
+                {
+                    let mut o_q = outqueue.lock().unwrap();
+                    for (o_ch, o_q_ch) in outframe.outer_iter().zip(o_q.iter_mut()) {
+                        for &o in o_ch.iter() {
+                            o_q_ch.push_back(o)
                         }
                     }
-                    true
-                } else {
-                    false
                 }
-            };
-            if !got_samples {
-                sleep(sleep_duration);
-                continue;
+                let td_ms = t0.elapsed().as_secs_f32() * 1000.;
+                log::debug!(
+                    "DF {} | Enhanced {:.1}ms frame. SNR: {:>5.1}, Processing time: {:>4.1}ms, RTF: {:.2}",
+                    id,
+                    t_audio_ms,
+                    lsnr,
+                    td_ms,
+                    td_ms / t_audio_ms
+                );
             }
-            let t0 = Instant::now();
-            let lsnr = df
-                .process(inframe.view(), outframe.view_mut())
-                .expect("Error during df::process");
-            {
-                let mut o_q = outqueue.lock().unwrap();
-                for (o_ch, o_q_ch) in outframe.outer_iter().zip(o_q.iter_mut()) {
-                    for &o in o_ch.iter() {
-                        o_q_ch.push_back(o)
-                    }
-                }
-            }
-            let td_ms = t0.elapsed().as_secs_f32() * 1000.;
-            log::debug!(
-                "DF {} | Enhanced {:.1}ms frame. SNR: {:>5.1}, Processing time: {:>4.1}ms, RTF: {:.2}",
-                id,
-                t_audio_ms,
-                lsnr,
-                td_ms,
-                td_ms / t_audio_ms
-            );
-        }
+        });
     }
 }
 
 /// Initialize DF model and returns sample rate and frame size
 fn init_df(channels: usize) -> (usize, usize) {
-    unsafe {
-        if let Some(m) = MODEL.as_ref() {
-            if m.ch == channels {
-                return (m.sr, m.hop_size);
-            }
-        }
-    }
-
-    let df_params = DfParams::default();
-    let r_params = RuntimeParams::default_with_ch(channels);
-    let df = DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
-    let (sr, frame_size) = (df.sr, df.hop_size);
-    unsafe { MODEL = Some(df) };
-    (sr, frame_size)
+    log::trace!("Returning initialized df");
+    CHANNELS.store(channels, Ordering::Release);
+    MODEL.with_borrow(|model| (model.sr, model.hop_size))
 }
 
 fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
@@ -223,6 +230,7 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
 
         let (control_tx, control_rx) = sync_channel(32);
 
+        log::trace!("Starting df worker function");
         let worker_handle = thread::spawn(get_worker_fn(
             Arc::clone(&i_tx),
             Arc::clone(&o_rx),
@@ -344,6 +352,7 @@ impl Plugin for DfPlugin {
             let init = Arc::new(Event::new());
             let done = Arc::new(Event::new());
             let init_listen = init.listen();
+            log::trace!("Starting dbus worker");
             self._dbus = Some((
                 thread::spawn(get_dbus_worker(
                     self.control_tx.clone(),
@@ -573,12 +582,13 @@ impl DfDbusControl {
 }
 
 #[no_mangle]
-pub fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> {
+pub extern "C" fn get_ladspa_descriptor(index: u64) -> PluginDescriptor {
+    log::trace!("Getting ladspa descriptor {}", index);
     match index {
-        0 => Some(PluginDescriptor {
+        0 => PluginDescriptor {
             unique_id: ID_MONO,
             label: "deep_filter_mono",
-            properties: ladspa::PROP_NONE,
+            properties: ladspa::Properties::PROP_NONE,
             name: "DeepFilter Mono",
             maker: "Hendrik Schröter",
             copyright: "MIT/Apache",
@@ -643,11 +653,11 @@ pub fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> {
                 },
             ],
             new: |d, sr| Box::new(get_new_df(1)(d, sr)),
-        }),
-        1 => Some(PluginDescriptor {
+        },
+        1 => PluginDescriptor {
             unique_id: ID_STEREO,
             label: "deep_filter_stereo",
-            properties: ladspa::PROP_NONE,
+            properties: ladspa::Properties::PROP_NONE,
             name: "DeepFilter Stereo",
             maker: "Hendrik Schröter",
             copyright: "MIT/Apache",
@@ -722,7 +732,9 @@ pub fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> {
                 },
             ],
             new: |d, sr| Box::new(get_new_df(2)(d, sr)),
-        }),
-        _ => None,
+        },
+        _ => {
+            panic!("Unexpected plugin index: {index}");
+        },
     }
 }

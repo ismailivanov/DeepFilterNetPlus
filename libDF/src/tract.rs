@@ -35,17 +35,34 @@ impl DfParams {
         Self::from_targz(tar_buf)
     }
     fn from_targz<R: Read>(f: R) -> Result<Self> {
+        log::trace!("Extracting .tar.gz. Creating gz decoder...");
         let tar = GzDecoder::new(f);
+        log::trace!("Creating ar decoder...");
         let mut archive = Archive::new(tar);
         let mut enc = Vec::new();
         let mut erb_dec = Vec::new();
         let mut df_dec = Vec::new();
         let mut config = Ini::new();
+        log::trace!("Iterating through entries...");
         for e in archive.entries().context("Could not extract models from tar file.")? {
             let mut file = e.context("Could not open model tar entry.")?;
-            let path = file.path().unwrap();
+            let path = match file.path() {
+                Ok(val) => val,
+                Err(e) => {
+                    log::error!("Unable to find file path: {}", e);
+                    return Err(e.into());
+                }
+            };
+            log::trace!("Examining {}", path.display());
             if path.ends_with("enc.onnx") {
-                file.read_to_end(&mut enc)?;
+                log::trace!("Reading {} to end...", path.display());
+                match file.read_to_end(&mut enc) {
+                    Ok(size) => log::info!("enc.onnx was {} bytes", size),
+                    Err(e) => {
+                        log::error!("Unable to read enc.onnx: {e}");
+                        return Err(e.into());
+                    }
+                }
             } else if path.ends_with("erb_dec.onnx") {
                 file.read_to_end(&mut erb_dec)?;
             } else if path.ends_with("df_dec.onnx") {
@@ -61,6 +78,7 @@ impl DfParams {
                 log::warn!("Found non-matching item in model tar file: {:?}", path)
             }
         }
+        log::trace!("Finished extracting everything");
         Ok(Self {
             config,
             enc,
@@ -70,24 +88,28 @@ impl DfParams {
     }
 }
 impl Default for DfParams {
-    #[allow(unreachable_code)]
     fn default() -> Self {
+        #[cfg(not(any(feature = "default-model-ll", feature = "default-model")))]
+        panic!("Not compiled with a default model");
         #[cfg(feature = "default-model-ll")]
         {
             log::debug!("Loading model DeepFilterNet3_ll_onnx.tar.gz");
-            return DfParams::from_bytes(include_bytes!(
-                "../../models/DeepFilterNet3_ll_onnx.tar.gz"
-            ))
-            .expect("Could not load model config");
+            match DfParams::from_bytes(include_bytes!("../../models/DeepFilterNet3_ll_onnx.tar.gz"))
+            {
+                Ok(val) => return val,
+                Err(e) => {
+                    log::error!("Unable to load model: {e}");
+                    eprintln!("Unable to load model: {e}");
+                    panic!("Could not load model config");
+                }
+            }
         }
-        #[cfg(feature = "default-model")]
+        #[cfg(all(feature = "default-model", not(feature = "default-model-ll")))]
         {
             log::debug!("Loading model DeepFilterNet3_onnx.tar.gz");
             DfParams::from_bytes(include_bytes!("../../models/DeepFilterNet3_onnx.tar.gz"))
                 .expect("Could not load model config")
         }
-        #[cfg(not(feature = "default-model"))]
-        panic!("Not compiled with a default model")
     }
 }
 
@@ -173,7 +195,7 @@ impl RuntimeParams {
         self.reduce_mask = red;
         self
     }
-    pub fn default_with_ch(channels: usize) -> Self {
+    pub const fn default_with_ch(channels: usize) -> Self {
         RuntimeParams {
             n_ch: channels,
             post_filter: false,
