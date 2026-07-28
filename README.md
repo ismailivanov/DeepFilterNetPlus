@@ -1,4 +1,15 @@
-# DeepFilterNet
+# DeepFilterNet Plus
+
+A maintained fork of [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) with critical fixes on top of upstream:
+
+- **Real-time safe LADSPA plugin** ([#661](https://github.com/Rikorose/DeepFilterNet/issues/661)): `run()` no longer blocks the host's real-time thread, eliminating system-wide crackling at small PipeWire quanta. Latency adapts automatically and overload no longer crashes the audio server.
+- **Stereo inference fix**: multi-channel models panicked with tract >= 0.21.5 (`to_scalar` on per-channel lsnr); the worker now averages channel estimates and falls back to unprocessed passthrough if it ever dies.
+- Merged upstream PRs: [#645](https://github.com/Rikorose/DeepFilterNet/pull/645), [#648](https://github.com/Rikorose/DeepFilterNet/pull/648), [#652](https://github.com/Rikorose/DeepFilterNet/pull/652), [#653](https://github.com/Rikorose/DeepFilterNet/pull/653), [#666](https://github.com/Rikorose/DeepFilterNet/pull/666), [#676](https://github.com/Rikorose/DeepFilterNet/pull/676), [#685](https://github.com/Rikorose/DeepFilterNet/pull/685) (tract 0.21.15, workspace unified on ndarray 0.16, pyo3 0.25 / Python 3.13).
+
+The LADSPA library name (`libdeep_filter_ladspa.so`) and plugin identifiers are unchanged, so it remains a drop-in replacement for EasyEffects and PipeWire filter-chain setups.
+
+---
+
 A Low Complexity Speech Enhancement Framework for Full-Band Audio (48kHz) using on Deep Filtering.
 
 ![deepfilternet3](https://user-images.githubusercontent.com/16517898/225623209-a54fea75-ca00-404c-a394-c91d2d1146d2.svg)
