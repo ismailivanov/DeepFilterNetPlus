@@ -42,8 +42,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test -p deep-filter-ladspa --release
       - name: Build deep-filter CLI
+        # Fat LTO shrinks the CLI ~30%; the LADSPA cdylib gains nothing from it
+        # (exported C ABI prevents pruning), so the plugin stays on `release`.
         run: >
-          cargo build --release -p deep_filter
+          cargo build --profile release-lto -p deep_filter
           --no-default-features
           --features bin,tract,default-model,wav-utils,transforms,logging
           --bin deep-filter
@@ -52,7 +54,7 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release-lto/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
           # The LADSPA plugin targets EasyEffects/PipeWire and is Linux-only
           if [ "$RUNNER_OS" = "Linux" ]; then
             cargo build --release -p deep-filter-ladspa --target ${{ matrix.target }}

@@ -121,7 +121,9 @@ fn get_worker_fn(
         let mut df =
             DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
         init_tx.send((df.sr, df.hop_size)).expect("Failed to report model parameters");
-        let sleep_duration = Duration::from_secs_f32(df.hop_size as f32 / df.sr as f32 / 5.);
+        // Poll interval bounds the input-side latency jitter; 0.5ms keeps it
+        // negligible against the 10ms frame budget at trivial wakeup cost.
+        let sleep_duration = Duration::from_secs_f32(df.hop_size as f32 / df.sr as f32 / 20.);
         let mut inframe = Array2::zeros((df.ch, df.hop_size));
         let mut outframe = Array2::zeros((df.ch, df.hop_size));
         let t_audio_ms = df.hop_size as f32 / df.sr as f32 * 1000.;
@@ -141,8 +143,8 @@ fn get_worker_fn(
                 let mut q = inqueue.lock().unwrap();
                 if q[0].len() >= df.hop_size {
                     for (i_q_ch, mut i_ch) in q.iter_mut().zip(inframe.outer_iter_mut()) {
-                        for i in i_ch.iter_mut() {
-                            *i = i_q_ch.pop_front().unwrap();
+                        for (i, s) in i_ch.iter_mut().zip(i_q_ch.drain(..df.hop_size)) {
+                            *i = s;
                         }
                     }
                     true
@@ -161,9 +163,7 @@ fn get_worker_fn(
             {
                 let mut o_q = outqueue.lock().unwrap();
                 for (o_ch, o_q_ch) in outframe.outer_iter().zip(o_q.iter_mut()) {
-                    for &o in o_ch.iter() {
-                        o_q_ch.push_back(o)
-                    }
+                    o_q_ch.extend(o_ch.iter().copied());
                 }
             }
             let td_ms = t0.elapsed().as_secs_f32() * 1000.;
@@ -436,9 +436,7 @@ impl Plugin for DfPlugin {
         {
             let i_q = &mut self.i_tx.lock().unwrap();
             for (i_ch, i_q_ch) in inputs.iter().zip(i_q.iter_mut()) {
-                for &i in i_ch.iter() {
-                    i_q_ch.push_back(i)
-                }
+                i_q_ch.extend(i_ch.iter().copied());
             }
         }
 
@@ -451,8 +449,8 @@ impl Plugin for DfPlugin {
             let o_q = &mut self.o_rx.lock().unwrap();
             if o_q[0].len() >= sample_count {
                 for (o_q_ch, o_ch) in o_q.iter_mut().zip(outputs.iter_mut()) {
-                    for o in o_ch.iter_mut() {
-                        *o = o_q_ch.pop_front().unwrap();
+                    for (o, s) in o_ch.iter_mut().zip(o_q_ch.drain(..sample_count)) {
+                        *o = s;
                     }
                 }
                 self.min_q_level = self.min_q_level.min(o_q[0].len());
@@ -514,11 +512,9 @@ impl Plugin for DfPlugin {
             {
                 let o_q = &mut self.o_rx.lock().unwrap();
                 for o_q_ch in o_q.iter_mut() {
-                    for _ in 0..self.frame_size {
-                        // Cannot fail: the queue never dropped below frame_size
-                        // and the worker only ever adds samples.
-                        o_q_ch.pop_front().unwrap();
-                    }
+                    // Cannot underflow: the queue never dropped below frame_size
+                    // and the worker only ever adds samples.
+                    o_q_ch.drain(..self.frame_size);
                 }
             }
             self.proc_delay -= self.frame_size;
