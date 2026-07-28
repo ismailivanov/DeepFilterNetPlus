@@ -58,6 +58,7 @@ struct DfPlugin {
     frame_size: usize,
     proc_delay: usize,
     t_proc_change: usize,
+    min_q_level: usize, // Lowest output queue level since the last latency change
     worker_dead: bool,
     control_hist: DfControlHistory,
     _h: JoinHandle<()>, // Worker thread handle
@@ -240,6 +241,7 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
             frame_size,
             proc_delay,
             t_proc_change: 0,
+            min_q_level: usize::MAX,
             worker_dead: false,
             control_hist: hist,
             _h: worker_handle,
@@ -441,6 +443,7 @@ impl Plugin for DfPlugin {
                         *o = o_q_ch.pop_front().unwrap();
                     }
                 }
+                self.min_q_level = self.min_q_level.min(o_q[0].len());
                 false
             } else {
                 for o_ch in outputs.iter_mut() {
@@ -470,8 +473,17 @@ impl Plugin for DfPlugin {
                 }
                 self.proc_delay = self.frame_size;
             } else {
-                // The silence emitted above delays the queued samples accordingly.
-                self.proc_delay += sample_count;
+                // The silence emitted above already delays the queued samples by
+                // sample_count. With small host quanta that converges too slowly
+                // (one warning every few seconds while latency creeps up), so
+                // grow by at least one full frame by extending the current gap.
+                let extra = self.frame_size.saturating_sub(sample_count);
+                for o_ch in self.o_rx.lock().unwrap().iter_mut() {
+                    for _ in 0..extra {
+                        o_ch.push_front(0f32);
+                    }
+                }
+                self.proc_delay += sample_count + extra;
                 log::warn!(
                     "DF {} | Output underrun. Increasing processing latency to {:.1}ms",
                     self.id,
@@ -479,33 +491,32 @@ impl Plugin for DfPlugin {
                 );
             }
             self.t_proc_change = 0;
+            self.min_q_level = usize::MAX;
         } else if self.t_proc_change > 10 * self.sr
             && self.proc_delay
                 >= self.frame_size * (1 + self.control_hist.min_buffer_frames as usize)
+            && self.min_q_level >= self.frame_size
         {
-            // No underrun for 10s and a full spare frame buffered: reduce delay again
-            let dropped_samples = {
+            // No underrun for 10s and even the worst-case queue level kept a
+            // full spare frame: that margin is unused, trim it.
+            {
                 let o_q = &mut self.o_rx.lock().unwrap();
-                if o_q[0].len() < self.frame_size {
-                    false
-                } else {
-                    for o_q_ch in o_q.iter_mut() {
-                        for _ in 0..self.frame_size {
-                            o_q_ch.pop_front().unwrap();
-                        }
+                for o_q_ch in o_q.iter_mut() {
+                    for _ in 0..self.frame_size {
+                        // Cannot fail: the queue never dropped below frame_size
+                        // and the worker only ever adds samples.
+                        o_q_ch.pop_front().unwrap();
                     }
-                    true
                 }
-            };
-            if dropped_samples {
-                self.proc_delay -= self.frame_size;
-                self.t_proc_change = 0;
-                log::info!(
-                    "DF {} | Decreasing processing latency to {:.1}ms",
-                    self.id,
-                    self.proc_delay as f32 * 1000. / self.sr as f32
-                );
             }
+            self.proc_delay -= self.frame_size;
+            self.t_proc_change = 0;
+            self.min_q_level = usize::MAX;
+            log::info!(
+                "DF {} | Decreasing processing latency to {:.1}ms",
+                self.id,
+                self.proc_delay as f32 * 1000. / self.sr as f32
+            );
         }
         // Counts samples since the last latency change, independent of quantum size
         self.t_proc_change += sample_count;
