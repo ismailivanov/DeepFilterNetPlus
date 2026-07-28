@@ -115,6 +115,22 @@ fn run_never_blocks_rt_thread_mono() {
     check_plugin(0, 1);
 }
 
+/// Issue #543: hosts running at other sample rates (e.g. 16kHz embedded
+/// boards) must get a clean, fast rejection instead of seconds of model
+/// loading followed by a leaked worker thread. The ladspa FFI layer catches
+/// the panic and reports a failed instantiation to the host.
+#[test]
+fn unsupported_sample_rate_rejected_before_model_build() {
+    let desc = get_ladspa_descriptor(0).expect("no mono descriptor");
+    let t0 = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (desc.new)(&desc, 16000)));
+    assert!(result.is_err(), "instantiating at 16kHz must be rejected");
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "rejection must happen before the model is built"
+    );
+}
+
 #[test]
 fn run_never_blocks_rt_thread_stereo() {
     check_plugin(1, 2);

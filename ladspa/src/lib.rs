@@ -198,6 +198,18 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
                 .init();
         });
 
+        // The bundled model is fixed at 48kHz. Check before building the model:
+        // this panic is caught by the ladspa FFI layer (the host just skips the
+        // plugin), while the old post-init assert wasted seconds of model
+        // loading and leaked the worker thread first (issue #543).
+        if sample_rate != 48000 {
+            log::error!(
+                "DeepFilter requires a 48000 Hz host sample rate, got {sample_rate} Hz. \
+                 Configure your sound server to run at 48 kHz."
+            );
+            panic!("DeepFilter: unsupported sample rate {sample_rate}");
+        }
+
         let i_tx = Arc::new(Mutex::new(vec![VecDeque::new(); channels]));
         let o_rx = Arc::new(Mutex::new(vec![VecDeque::new(); channels]));
         let id = Uuid::new_v4().as_urn().to_string().split_at(33).1.to_string();
