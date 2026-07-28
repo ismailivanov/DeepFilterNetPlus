@@ -467,7 +467,11 @@ impl DfTract {
             TValue::from(self.cplx_buf.clone().into_tensor().permute_axes(&[0, 3, 1, 2])?)
         ))?;
 
-        let &lsnr = enc_emb.pop().unwrap().to_scalar::<f32>()?;
+        // One lsnr estimate per channel; average them. tract >= 0.21.5 rejects
+        // to_scalar() on multi-value tensors, which broke multi-channel models.
+        let lsnr_t = enc_emb.pop().unwrap();
+        let lsnr_view = lsnr_t.to_array_view::<f32>()?;
+        let lsnr = lsnr_view.iter().sum::<f32>() / lsnr_view.len() as f32;
         let c0 = enc_emb.pop().unwrap();
         let emb = enc_emb.pop().unwrap();
 

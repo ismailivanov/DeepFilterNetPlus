@@ -58,6 +58,7 @@ struct DfPlugin {
     frame_size: usize,
     proc_delay: usize,
     t_proc_change: usize,
+    worker_dead: bool,
     control_hist: DfControlHistory,
     _h: JoinHandle<()>, // Worker thread handle
     #[cfg(feature = "dbus")]
@@ -239,6 +240,7 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
             frame_size,
             proc_delay,
             t_proc_change: 0,
+            worker_dead: false,
             control_hist: hist,
             _h: worker_handle,
             #[cfg(feature = "dbus")]
@@ -381,6 +383,26 @@ impl Plugin for DfPlugin {
             outputs.push(ports[i].unwrap_audio_mut());
             i += 1;
         }
+
+        // If the worker died (e.g. a model inference error), pass audio through
+        // unprocessed instead of emitting silence forever. Also skips the
+        // control channel whose receiver is gone.
+        if self.worker_dead || self._h.is_finished() {
+            if !self.worker_dead {
+                self.worker_dead = true;
+                log::error!(
+                    "DF {} | Worker thread died; passing audio through unprocessed",
+                    self.id
+                );
+            }
+            for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
+                for (&i, o) in i_ch.iter().zip(o_ch.iter_mut()) {
+                    *o = i
+                }
+            }
+            return;
+        }
+
         for p in ports[i..].iter() {
             let &v = p.unwrap_control();
             let c = DfControl::from_port_name(p.port.name);
