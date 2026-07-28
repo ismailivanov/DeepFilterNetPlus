@@ -1,0 +1,7 @@
+*/pkg/
+*/src/
+*/*.pkg.tar.*
+*/deepfilternetplus/
+*/deep-filter-*
+*/libdeep_filter_ladspa-*
+*/LICENSE-*-1.*
