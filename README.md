@@ -25,6 +25,17 @@ No compilation is required. Pick what you want to do:
 
 ## Microphone noise suppression (Linux)
 
+### Arch Linux, CachyOS, Manjaro (AUR)
+
+One command installs both the microphone plugin and the `deep-filter` command-line app:
+
+```bash
+yay -S deepfilternet-plus-bin
+```
+
+(Use `deepfilternet-plus-git` instead to build from the latest source.) Then install EasyEffects
+from your distribution, open **Input**, and add **Deep Noise Remover**.
+
 ### Easiest setup
 
 1. [Install EasyEffects from Flathub](https://flathub.org/apps/com.github.wwmm.easyeffects).
