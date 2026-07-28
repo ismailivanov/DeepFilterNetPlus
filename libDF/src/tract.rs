@@ -232,6 +232,7 @@ pub struct DfTract {
     rolling_spec_buf_y: VecDeque<Tensor>, // Enhanced stage 1 spec buf
     rolling_spec_buf_x: VecDeque<Tensor>, // Noisy spec buf
     skip_counter: usize,  // Increment when wanting to skip processing due to low RMS
+    clipping_warned: bool, // Rate-limits the clipping warning to once per episode
 }
 
 #[cfg(all(not(feature = "capi"), feature = "default-model"))]
@@ -363,6 +364,7 @@ impl DfTract {
             post_filter: rp.post_filter,
             post_filter_beta: rp.post_filter_beta,
             skip_counter: 0,
+            clipping_warned: false,
         };
         m.init()?;
         #[cfg(feature = "timings")]
@@ -532,8 +534,16 @@ impl DfTract {
             enh.fill(0.);
             return Ok(-15.);
         }
+        // Warn once per clipping episode instead of once per 10ms frame, which
+        // flooded the log during live use (upstream #358). Hysteresis avoids
+        // flapping around the threshold.
         if max_a > 0.9999 {
-            log::warn!("Possible clipping detected ({:.3}).", max_a)
+            if !self.clipping_warned {
+                self.clipping_warned = true;
+                log::warn!("Possible clipping detected ({:.3}).", max_a)
+            }
+        } else if max_a < 0.99 {
+            self.clipping_warned = false;
         }
 
         // Signal model: y = f(s + n) = f(x)
