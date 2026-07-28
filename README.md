@@ -8,11 +8,11 @@ A maintained fork of [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) 
 
 The LADSPA library name (`libdeep_filter_ladspa.so`) and plugin identifiers are unchanged, so it remains a drop-in replacement for EasyEffects and PipeWire filter-chain setups.
 
-## Easy installation (Linux)
+## Easy installation
 
-You do not need to compile anything. Prebuilt files for x86_64 Linux are on the [Releases page](https://github.com/ismailivanov/DeepFilterNetPlus/releases).
+You do not need to compile anything. Prebuilt files for Linux, macOS and Windows are on the [Releases page](https://github.com/ismailivanov/DeepFilterNetPlus/releases).
 
-### Noise suppression for your microphone (EasyEffects)
+### Noise suppression for your microphone (EasyEffects, Linux)
 
 1. Download `libdeep_filter_ladspa.so` from the latest release.
 2. Copy it to your system's LADSPA folder:
@@ -29,15 +29,31 @@ That's it — speak into your mic and the background noise is gone. If you alrea
 
 Install the `.so` the same way, then follow the [LADSPA/PipeWire guide](ladspa/README.md) to set up a virtual noise-suppressed microphone.
 
-### Clean up audio files from the terminal
+### Clean up audio files from the terminal (Linux, macOS, Windows)
 
-1. Download `deep-filter` from the latest release.
-2. Make it executable and run it on any noisy recording:
+`deep-filter` removes background noise from recorded audio files — handy for cleaning up podcast or video recordings after the fact.
+
+1. Download the build for your system from the latest release:
+   - Linux: `deep-filter-linux-x86_64`
+   - macOS (Apple Silicon): `deep-filter-macos-arm64`
+   - macOS (Intel): `deep-filter-macos-x86_64`
+   - Windows: `deep-filter-windows-x86_64.exe`
+2. Linux/macOS — make it executable and run it on any noisy recording:
 
    ```bash
-   chmod +x deep-filter
-   ./deep-filter noisy.wav -o output-folder/
+   chmod +x deep-filter-linux-x86_64
+   ./deep-filter-linux-x86_64 noisy.wav -o output-folder/
    ```
+
+   On macOS, if Gatekeeper blocks the downloaded file, allow it once with:
+   `xattr -d com.apple.quarantine deep-filter-macos-arm64`
+3. Windows — run it from a terminal (PowerShell or cmd):
+
+   ```
+   .\deep-filter-windows-x86_64.exe noisy.wav -o output-folder\
+   ```
+
+The microphone plugin (`libdeep_filter_ladspa.so`) is Linux-only, since EasyEffects and PipeWire are Linux technologies.
 
 ---
 

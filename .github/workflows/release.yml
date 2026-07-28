@@ -9,34 +9,71 @@ permissions:
   contents: write
 
 jobs:
-  build-release:
-    runs-on: ubuntu-22.04 # older glibc for wider distro compatibility
+  build:
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04 # older glibc for wider distro compatibility
+            target: x86_64-unknown-linux-gnu
+            asset: deep-filter-linux-x86_64
+            bin: deep-filter
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: deep-filter-macos-arm64
+            bin: deep-filter
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: deep-filter-macos-x86_64
+            bin: deep-filter
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: deep-filter-windows-x86_64.exe
+            bin: deep-filter.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Run LADSPA real-time regression tests
+        if: runner.os == 'Linux'
         run: cargo test -p deep-filter-ladspa --release
-      - name: Build LADSPA plugin and CLI
+      - name: Build deep-filter CLI
+        run: >
+          cargo build --release -p deep_filter
+          --no-default-features
+          --features bin,tract,default-model,wav-utils,transforms,logging
+          --bin deep-filter
+          --target ${{ matrix.target }}
+      - name: Collect artifacts
+        shell: bash
         run: |
-          cargo build --release -p deep-filter-ladspa
-          cargo build --release -p deep_filter \
-            --no-default-features \
-            --features bin,tract,default-model,wav-utils,transforms,logging \
-            --bin deep-filter
-          strip target/release/libdeep_filter_ladspa.so target/release/deep-filter
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          # The LADSPA plugin targets EasyEffects/PipeWire and is Linux-only
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo build --release -p deep-filter-ladspa --target ${{ matrix.target }}
+            cp "target/${{ matrix.target }}/release/libdeep_filter_ladspa.so" dist/
+            strip dist/*
+          fi
+      - uses: actions/upload-artifact@v4
         with:
-          name: deep-filter-linux-x86_64
-          path: |
-            target/release/libdeep_filter_ladspa.so
-            target/release/deep-filter
-      - name: Create release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            target/release/libdeep_filter_ladspa.so
-            target/release/deep-filter
+          files: dist/*
