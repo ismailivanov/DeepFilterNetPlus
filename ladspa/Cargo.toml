@@ -6,7 +6,7 @@ edition = "2024"
 license = "MIT/Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [features]
 dbus = ["dep:zbus", "dep:event-listener"]

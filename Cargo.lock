@@ -1188,7 +1188,7 @@ dependencies = [
  "image",
  "itertools 0.12.1",
  "log",
- "ndarray 0.15.6",
+ "ndarray 0.16.1",
  "ringbuf",
  "rubato 0.15.0",
 ]
