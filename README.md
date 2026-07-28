@@ -8,6 +8,37 @@ A maintained fork of [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) 
 
 The LADSPA library name (`libdeep_filter_ladspa.so`) and plugin identifiers are unchanged, so it remains a drop-in replacement for EasyEffects and PipeWire filter-chain setups.
 
+## Easy installation (Linux)
+
+You do not need to compile anything. Prebuilt files for x86_64 Linux are on the [Releases page](https://github.com/ismailivanov/DeepFilterNetPlus/releases).
+
+### Noise suppression for your microphone (EasyEffects)
+
+1. Download `libdeep_filter_ladspa.so` from the latest release.
+2. Copy it to your system's LADSPA folder:
+
+   ```bash
+   sudo install -m755 ~/Downloads/libdeep_filter_ladspa.so /usr/lib/ladspa/
+   ```
+
+3. Restart EasyEffects, then add the **Deep Noise Remover** effect to your microphone (Input) chain.
+
+That's it — speak into your mic and the background noise is gone. If you already had the plugin installed, the same two steps update it in place (restart EasyEffects afterwards).
+
+### Without EasyEffects (PipeWire filter-chain)
+
+Install the `.so` the same way, then follow the [LADSPA/PipeWire guide](ladspa/README.md) to set up a virtual noise-suppressed microphone.
+
+### Clean up audio files from the terminal
+
+1. Download `deep-filter` from the latest release.
+2. Make it executable and run it on any noisy recording:
+
+   ```bash
+   chmod +x deep-filter
+   ./deep-filter noisy.wav -o output-folder/
+   ```
+
 ---
 
 A Low Complexity Speech Enhancement Framework for Full-Band Audio (48kHz) using on Deep Filtering.
