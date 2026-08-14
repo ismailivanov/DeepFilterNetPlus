@@ -59,8 +59,10 @@ pub struct DFState {
     pub erb: Vec<usize>, // frequencies bandwidth (in bands) per ERB band
     analysis_mem: Vec<f32>,
     analysis_scratch: Vec<Complex32>,
+    analysis_buf: Vec<f32>, // Persistent FFT input; avoids a per-hop allocation
     synthesis_mem: Vec<f32>,
     synthesis_scratch: Vec<Complex32>,
+    synthesis_buf: Vec<f32>, // Persistent IFFT output; avoids a per-hop allocation
     mean_norm_state: Vec<f32>,
     unit_norm_state: Vec<f32>,
 }
@@ -120,6 +122,8 @@ impl DFState {
         let synthesis_mem = vec![0.; fft_size - frame_size];
         let analysis_scratch = forward.make_scratch_vec();
         let synthesis_scratch = backward.make_scratch_vec();
+        let analysis_buf = forward.make_input_vec();
+        let synthesis_buf = backward.make_output_vec();
 
         let erb = erb_fb(sr, fft_size, nb_bands, min_nb_freqs);
 
@@ -144,8 +148,10 @@ impl DFState {
             erb,
             analysis_mem,
             analysis_scratch,
+            analysis_buf,
             synthesis_mem,
             synthesis_scratch,
+            synthesis_buf,
             window,
             wnorm,
             mean_norm_state,
@@ -254,7 +260,9 @@ pub fn band_unit_norm(xs: &mut [Complex32], state: &mut [f32], alpha: f32) {
     debug_assert_eq!(xs.len(), state.len());
     for (x, s) in xs.iter_mut().zip(state.iter_mut()) {
         *s = x.norm() * (1. - alpha) + *s * alpha;
-        *x /= s.sqrt();
+        // The max() guards against NaN on sustained digital silence, where the
+        // exponential state underflows to 0 after ~1.5 min (0.0/0.0).
+        *x /= s.max(1e-10).sqrt();
     }
 }
 
@@ -272,8 +280,10 @@ pub fn band_unit_norm_t(xs: &[Complex32], state: &mut [f32], alpha: f32, out: &m
         o_im.iter_mut(),
     ) {
         *s = x.norm() * (1. - alpha) + *s * alpha;
-        *o_re /= s.sqrt();
-        *o_im /= s.sqrt();
+        // Write, don't divide: `out` is caller-provided scratch, not input.
+        let norm = s.max(1e-10).sqrt();
+        *o_re = x.re / norm;
+        *o_im = x.im / norm;
     }
 }
 
@@ -357,7 +367,8 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
     debug_assert_eq!(input.len(), state.frame_size);
     debug_assert_eq!(output.len(), state.freq_size);
 
-    let mut buf = state.fft_forward.make_input_vec();
+    // Take the persistent buffer to sidestep split borrows; moved back below.
+    let mut buf = std::mem::take(&mut state.analysis_buf);
     // First part of the window on the previous frame
     let (buf_first, buf_second) = buf.split_at_mut(state.window_size - state.frame_size);
     let (window_first, window_second) = state.window.split_at(state.window_size - state.frame_size);
@@ -386,6 +397,7 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
         .fft_forward
         .process_with_scratch(&mut buf, output, &mut state.analysis_scratch)
         .expect("FFT forward failed");
+    state.analysis_buf = buf;
     // Apply normalization in analysis only
     let norm = state.wnorm;
     for x in output.iter_mut() {
@@ -394,7 +406,8 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
 }
 
 fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFState) {
-    let mut x = state.fft_inverse.make_output_vec();
+    // Take the persistent buffer to sidestep split borrows; moved back below.
+    let mut x = std::mem::take(&mut state.synthesis_buf);
     match state
         .fft_inverse
         .process_with_scratch(input, &mut x, &mut state.synthesis_scratch)
@@ -424,6 +437,7 @@ fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFSt
         // Override left shifted buffer
         *mem = xi;
     }
+    state.synthesis_buf = x;
 }
 
 fn apply_window(xs: &[f32], window: &[f32]) -> Vec<f32> {

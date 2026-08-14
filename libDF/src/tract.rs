@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use ini::Ini;
-use tract_core::ndarray::{self, prelude::*, Axis};
+use tract_core::ndarray::{prelude::*, Axis};
 use tar::Archive;
 use tract_core::internal::tract_itertools::izip;
 use tract_core::internal::tract_smallvec::alloc::collections::VecDeque;
@@ -153,9 +153,8 @@ impl RuntimeParams {
     }
     pub fn with_post_filter(mut self, beta: f32) -> Self {
         assert!(beta >= 0.); // Cannot be negative
-        if beta > 0. {
-            self.post_filter = true;
-        }
+        // Keep flag and beta consistent in both directions: beta 0 disables.
+        self.post_filter = beta > 0.;
         self.post_filter_beta = beta;
         self
     }
@@ -169,6 +168,13 @@ impl RuntimeParams {
         max_db_erb_thresh: f32,
         max_db_df_thresh: f32,
     ) -> Self {
+        // apply_stages() assumes min <= df <= erb; out-of-order thresholds
+        // silently disable whole processing stages, so at least say so.
+        if !(min_db_thresh <= max_db_df_thresh && max_db_df_thresh <= max_db_erb_thresh) {
+            log::warn!(
+                "Threshold ordering should be min ({min_db_thresh}) <= max_df ({max_db_df_thresh}) <= max_erb ({max_db_erb_thresh}); some processing stages will never run"
+            );
+        }
         self.min_db_thresh = min_db_thresh;
         self.max_db_erb_thresh = max_db_erb_thresh;
         self.max_db_df_thresh = max_db_df_thresh;
@@ -182,7 +188,8 @@ impl RuntimeParams {
         RuntimeParams {
             n_ch: channels,
             post_filter: false,
-            post_filter_beta: 0.02,
+            post_filter_beta: 0., // consistent with post_filter: false
+
             atten_lim_db: 100.,
             min_db_thresh: -10.,
             max_db_erb_thresh: 30.,
@@ -228,10 +235,8 @@ pub struct DfTract {
     pub spec_buf: Tensor, // Real-valued spectrogram buffer of shape [n_ch, 1, 1, n_freqs, 2]
     erb_buf: TValue,      // Real-valued ERB feature buffer of shape [n_ch, 1, 1, n_erb]
     cplx_buf: TValue,     // Real-valued complex epectrum shape for DF of shape [n_ch, 1, nb_df, 2]
-    m_zeros: Vec<f32>,    // Preallocated buffer for applying a zero mask
     rolling_spec_buf_y: VecDeque<Tensor>, // Enhanced stage 1 spec buf
     rolling_spec_buf_x: VecDeque<Tensor>, // Noisy spec buf
-    skip_counter: usize,  // Increment when wanting to skip processing due to low RMS
     clipping_warned: bool, // Rate-limits the clipping warning to once per episode
 }
 
@@ -309,8 +314,6 @@ impl DfTract {
         let cplx_buf = TValue::from(unsafe {
             Tensor::uninitialized_dt(f32::datum_type(), &[1, 1, nb_df, 2])?
         });
-        let m_zeros = vec![0.; nb_erb];
-
         let model_type = config.section(Some("train")).unwrap().get("model").unwrap();
         let lookahead = match model_type {
             "deepfilternet2" => bail!(
@@ -357,13 +360,11 @@ impl DfTract {
             spec_buf,
             erb_buf,
             cplx_buf,
-            m_zeros,
             rolling_spec_buf_y,
             rolling_spec_buf_x,
             df_states,
             post_filter: rp.post_filter,
             post_filter_beta: rp.post_filter_beta,
-            skip_counter: 0,
             clipping_warned: false,
         };
         m.init()?;
@@ -412,6 +413,9 @@ impl DfTract {
             self.rolling_spec_buf_y
                 .push_back(tensor0(0f32).broadcast_scalar_to_shape(&spec_shape)?);
         }
+        // Clear before refilling: a second init() call would otherwise double
+        // the deque length permanently and shift the noisy-reference index.
+        self.rolling_spec_buf_x.clear();
         for _ in 0..self.df_order.max(self.lookahead) {
             self.rolling_spec_buf_x
                 .push_back(tensor0(0f32).broadcast_scalar_to_shape(&spec_shape)?);
@@ -521,19 +525,7 @@ impl DfTract {
         debug_assert_eq!(noisy.len_of(Axis(0)), enh.len_of(Axis(0)));
         debug_assert_eq!(noisy.len_of(Axis(1)), enh.len_of(Axis(1)));
         debug_assert_eq!(noisy.len_of(Axis(1)), self.hop_size);
-        let (max_a, e) = noisy.iter().fold((0f32, 0f32), |acc, x| {
-            (acc.0.max(x.abs()), acc.1 + x.powi(2))
-        });
-        let rms = e / noisy.len() as f32;
-        if rms < 1e-7 {
-            self.skip_counter += 1;
-        } else {
-            self.skip_counter = 0;
-        }
-        if self.skip_counter > 5 {
-            enh.fill(0.);
-            return Ok(-15.);
-        }
+        let max_a = noisy.iter().fold(0f32, |acc, x| acc.max(x.abs()));
         // Warn once per clipping episode instead of once per 10ms frame, which
         // flooded the log during live use (upstream #358). Hysteresis avoids
         // flapping around the threshold.
@@ -547,8 +539,10 @@ impl DfTract {
         }
 
         // Signal model: y = f(s + n) = f(x)
-        self.rolling_spec_buf_y.pop_front();
-        self.rolling_spec_buf_x.pop_front();
+        // Recycle the popped tensors instead of cloning spec_buf: a Tensor
+        // clone is a fresh heap allocation, and this runs every 10ms frame.
+        let mut front_y = self.rolling_spec_buf_y.pop_front().unwrap();
+        let mut front_x = self.rolling_spec_buf_x.pop_front().unwrap();
         for (ns_ch, mut rbuf, state) in izip!(
             noisy.axis_iter(Axis(0)),
             self.spec_buf.to_array_view_mut()?.axis_iter_mut(Axis(0)),
@@ -557,8 +551,10 @@ impl DfTract {
             let spec = as_slice_mut_complex(rbuf.as_slice_mut().unwrap());
             state.analysis(ns_ch.as_slice().unwrap(), spec);
         }
-        self.rolling_spec_buf_y.push_back(self.spec_buf.clone());
-        self.rolling_spec_buf_x.push_back(self.spec_buf.clone());
+        front_y.as_slice_mut::<f32>()?.copy_from_slice(self.spec_buf.as_slice::<f32>()?);
+        front_x.as_slice_mut::<f32>()?.copy_from_slice(self.spec_buf.as_slice::<f32>()?);
+        self.rolling_spec_buf_y.push_back(front_y);
+        self.rolling_spec_buf_x.push_back(front_x);
         if self.atten_lim.unwrap_or_default() == 1. {
             enh.assign(&noisy);
             return Ok(35.);
@@ -595,15 +591,12 @@ impl DfTract {
                     );
                 }
             }
-            self.skip_counter = 0;
-        } else {
-            // gains are None => skipped due to LSNR
-            self.skip_counter += 1;
         }
-
-        // This spectrum will only be used for the upper frequecies
-        let spec = self.rolling_spec_buf_y.get_mut(self.df_order - 1).unwrap();
-        self.spec_buf.clone_from(spec);
+        // This spectrum will only be used for the upper frequecies.
+        // Slice copy, not clone_from: tract's Tensor does not specialize
+        // clone_from, so it would allocate a fresh tensor every frame.
+        let spec = self.rolling_spec_buf_y.get(self.df_order - 1).unwrap();
+        self.spec_buf.as_slice_mut::<f32>()?.copy_from_slice(spec.as_slice::<f32>()?);
         if let Some(coefs) = coefs {
             df(
                 &self.rolling_spec_buf_x,
@@ -647,13 +640,16 @@ impl DfTract {
             spec_enh.scaled_add(lim.into(), &spec_noisy);
         }
 
-        for (state, spec_ch, mut enh_out_ch) in izip!(
+        for (state, mut spec_ch, mut enh_out_ch) in izip!(
             self.df_states.iter_mut(),
-            spec_enh.axis_iter(Axis(0)),
+            spec_enh.axis_iter_mut(Axis(0)),
             enh.axis_iter_mut(Axis(0)),
         ) {
+            // In place instead of to_owned(): the IFFT may scribble over this
+            // spec_buf row, but the next frame's analysis fully rewrites it
+            // before anything reads it again.
             state.synthesis(
-                spec_ch.to_owned().as_slice_mut().unwrap(),
+                spec_ch.as_slice_mut().unwrap(),
                 enh_out_ch.as_slice_mut().unwrap(),
             );
         }
