@@ -16,6 +16,17 @@ use uuid::Uuid;
 
 static INIT_LOGGER: Once = Once::new();
 
+/// Wireless receivers and PipeWire graph discontinuities can inject garbage
+/// into the stream (observed in the field on a USB wireless headset: NaN
+/// bursts and float-max ±3.4e38 samples). NaN poisons the DSP for over a
+/// second and float-max values are full-scale pops, so anything outside a
+/// generous audio range is dropped to silence at every copy boundary.
+/// Real audio is |s| <= ~1; 16 (+24 dBFS) leaves headroom for hot chains.
+#[inline]
+fn finite_or_zero(s: f32) -> f32 {
+    if s.is_finite() && s.abs() <= 16. { s } else { 0. }
+}
+
 type SampleQueue = Arc<Mutex<Vec<VecDeque<f32>>>>;
 type ControlProd = SyncSender<(DfControl, f32)>;
 type ControlRecv = Receiver<(DfControl, f32)>;
@@ -48,6 +59,13 @@ const MIN_PROC_BUF_DEF: DefaultValue = DefaultValue::Minimum;
 const MIN_PROC_BUF_MIN: f32 = 0.;
 const MIN_PROC_BUF_MAX: f32 = 10.;
 
+// Overload circuit breaker: after this many backlog resets within one overload
+// episode the worker clearly cannot keep up; pass audio through unprocessed
+// for the cooldown instead of rebuilding a one-second silence staircase every
+// second (see docs/LADSPA_OVERLOAD_REPORT.md).
+const OVERLOAD_RESETS_TO_BYPASS: u32 = 3;
+const OVERLOAD_BYPASS_SECS: usize = 5;
+
 struct DfPlugin {
     i_tx: SampleQueue,
     o_rx: SampleQueue,
@@ -60,6 +78,12 @@ struct DfPlugin {
     t_proc_change: usize,
     min_q_level: usize, // Lowest output queue level since the last latency change
     worker_dead: bool,
+    in_overload: bool,      // Inside an overload episode (episode = until 1s clean)
+    ep_underruns: u32,      // Underruns in the current episode
+    ep_resets: u32,         // Backlog resets in the current episode
+    ep_samples: usize,      // Episode duration in samples
+    t_clean: usize,         // Samples since the last underrun
+    bypass_remaining: usize, // Samples left in overload-bypass cooldown
     control_hist: DfControlHistory,
     _h: JoinHandle<()>, // Worker thread handle
     #[cfg(feature = "dbus")]
@@ -163,7 +187,9 @@ fn get_worker_fn(
             {
                 let mut o_q = outqueue.lock().unwrap();
                 for (o_ch, o_q_ch) in outframe.outer_iter().zip(o_q.iter_mut()) {
-                    o_q_ch.extend(o_ch.iter().copied());
+                    // Second line of defense: never hand NaN to the graph even
+                    // if the DSP produced it internally.
+                    o_q_ch.extend(o_ch.iter().map(|&s| finite_or_zero(s)));
                 }
             }
             let td_ms = t0.elapsed().as_secs_f32() * 1000.;
@@ -255,6 +281,12 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
             t_proc_change: 0,
             min_q_level: usize::MAX,
             worker_dead: false,
+            in_overload: false,
+            ep_underruns: 0,
+            ep_resets: 0,
+            ep_samples: 0,
+            t_clean: 0,
+            bypass_remaining: 0,
             control_hist: hist,
             _h: worker_handle,
             #[cfg(feature = "dbus")]
@@ -263,7 +295,7 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum DfControl {
     AttenLim,
     PfBeta,
@@ -411,8 +443,38 @@ impl Plugin for DfPlugin {
             }
             for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
                 for (&i, o) in i_ch.iter().zip(o_ch.iter_mut()) {
-                    *o = i
+                    *o = finite_or_zero(i)
                 }
+            }
+            return;
+        }
+
+        // Overload-bypass cooldown: the worker proved it cannot keep up, so
+        // give it (and the system) a break. Unprocessed audio beats the
+        // silence the overload path would emit otherwise. The input queue is
+        // not fed, so the worker idles at its poll sleep.
+        if self.bypass_remaining > 0 {
+            self.bypass_remaining = self.bypass_remaining.saturating_sub(sample_count);
+            for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
+                for (&i, o) in i_ch.iter().zip(o_ch.iter_mut()) {
+                    *o = finite_or_zero(i)
+                }
+            }
+            if self.bypass_remaining == 0 {
+                // Re-arm the processed path exactly like at plugin init. The
+                // extra clear also flushes any stale in-flight frame the
+                // worker pushed after the queues were dropped.
+                for i_ch in self.i_tx.lock().unwrap().iter_mut() {
+                    i_ch.clear();
+                }
+                for o_ch in self.o_rx.lock().unwrap().iter_mut() {
+                    o_ch.clear();
+                    o_ch.extend(std::iter::repeat(0f32).take(self.frame_size));
+                }
+                self.proc_delay = self.frame_size;
+                self.t_proc_change = 0;
+                self.min_q_level = usize::MAX;
+                log::info!("DF {} | Overload cooldown over, resuming processing", self.id);
             }
             return;
         }
@@ -423,20 +485,22 @@ impl Plugin for DfPlugin {
             if c == DfControl::AttenLim && v >= 100. {
                 for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
                     for (&i, o) in i_ch.iter().zip(o_ch.iter_mut()) {
-                        *o = i
+                        *o = finite_or_zero(i)
                     }
                 }
             }
-            if v != self.control_hist.get(&c) {
+            // try_send, never send: a blocked control channel must not stall
+            // the real-time thread. On a full channel the history is left
+            // unchanged, so the value is retried on the next run().
+            if v != self.control_hist.get(&c) && self.control_tx.try_send((c, v)).is_ok() {
                 self.control_hist.set(&c, v);
-                self.control_tx.send((c, v)).expect("Failed to send control parameter");
             }
         }
 
         {
             let i_q = &mut self.i_tx.lock().unwrap();
             for (i_ch, i_q_ch) in inputs.iter().zip(i_q.iter_mut()) {
-                i_q_ch.extend(i_ch.iter().copied());
+                i_q_ch.extend(i_ch.iter().map(|&s| finite_or_zero(s)));
             }
         }
 
@@ -466,22 +530,60 @@ impl Plugin for DfPlugin {
         };
 
         if underrun {
-            if self.proc_delay >= self.sr {
-                // Sustained overload: no buffer size can fix this. Instead of
-                // killing the audio server, drop the stale backlog and restart
-                // from the initial latency.
-                log::error!(
-                    "DF {} | Processing too slow, dropping backlog. Try to decrease 'Max DF processing threshold (dB)'.",
-                    self.id,
+            // Logging is bounded per overload episode instead of per step: the
+            // old per-underrun warnings produced ~48 journal lines per second
+            // under sustained overload, feeding the very pressure that caused
+            // the overload (see docs/LADSPA_OVERLOAD_REPORT.md).
+            if !self.in_overload {
+                self.in_overload = true;
+                self.ep_underruns = 0;
+                self.ep_resets = 0;
+                self.ep_samples = 0;
+                log::warn!(
+                    "DF {} | Output underrun, increasing processing latency (one log per overload episode)",
+                    self.id
                 );
+            }
+            self.ep_underruns += 1;
+            self.t_clean = 0;
+            if self.proc_delay >= self.sr {
+                // Sustained overload: no buffer size can fix this. Drop the
+                // stale backlog and restart from the initial latency.
+                self.ep_resets += 1;
                 for i_ch in self.i_tx.lock().unwrap().iter_mut() {
                     i_ch.clear();
                 }
-                for o_ch in self.o_rx.lock().unwrap().iter_mut() {
-                    o_ch.clear();
-                    o_ch.extend(std::iter::repeat(0f32).take(self.frame_size));
+                if self.ep_resets >= OVERLOAD_RESETS_TO_BYPASS {
+                    // Circuit breaker: repeated resets mean the staircase will
+                    // just repeat. Bypass instead of emitting more silence.
+                    log::error!(
+                        "DF {} | Processing too slow ({} underruns, {} backlog resets in {:.1}s), \
+                         passing audio through unprocessed for {}s. \
+                         Try to decrease 'Max DF processing threshold (dB)'.",
+                        self.id,
+                        self.ep_underruns,
+                        self.ep_resets,
+                        self.ep_samples as f32 / self.sr as f32,
+                        OVERLOAD_BYPASS_SECS,
+                    );
+                    for o_ch in self.o_rx.lock().unwrap().iter_mut() {
+                        o_ch.clear();
+                    }
+                    self.bypass_remaining = OVERLOAD_BYPASS_SECS * self.sr;
+                    self.in_overload = false;
+                    // This quantum was zeroed above; pass it through instead.
+                    for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
+                        for (&i, o) in i_ch.iter().zip(o_ch.iter_mut()) {
+                            *o = finite_or_zero(i)
+                        }
+                    }
+                } else {
+                    for o_ch in self.o_rx.lock().unwrap().iter_mut() {
+                        o_ch.clear();
+                        o_ch.extend(std::iter::repeat(0f32).take(self.frame_size));
+                    }
+                    self.proc_delay = self.frame_size;
                 }
-                self.proc_delay = self.frame_size;
             } else {
                 // The silence emitted above already delays the queued samples by
                 // sample_count. With small host quanta that converges too slowly
@@ -494,14 +596,20 @@ impl Plugin for DfPlugin {
                     }
                 }
                 self.proc_delay += sample_count + extra;
-                log::warn!(
-                    "DF {} | Output underrun. Increasing processing latency to {:.1}ms",
-                    self.id,
-                    self.proc_delay as f32 * 1000. / self.sr as f32
-                );
             }
             self.t_proc_change = 0;
             self.min_q_level = usize::MAX;
+        } else if self.in_overload && self.t_clean >= self.sr {
+            // One second without underruns closes the episode.
+            self.in_overload = false;
+            log::info!(
+                "DF {} | Overload ended: {} underruns, {} backlog resets, {:.1}s, latency {:.1}ms",
+                self.id,
+                self.ep_underruns,
+                self.ep_resets,
+                self.ep_samples as f32 / self.sr as f32,
+                self.proc_delay as f32 * 1000. / self.sr as f32
+            );
         } else if self.t_proc_change > 10 * self.sr
             && self.proc_delay
                 >= self.frame_size * (1 + self.control_hist.min_buffer_frames as usize)
@@ -528,6 +636,12 @@ impl Plugin for DfPlugin {
         }
         // Counts samples since the last latency change, independent of quantum size
         self.t_proc_change += sample_count;
+        if !underrun {
+            self.t_clean += sample_count;
+        }
+        if self.in_overload {
+            self.ep_samples += sample_count;
+        }
     }
 }
 

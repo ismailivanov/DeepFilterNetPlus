@@ -21,6 +21,11 @@ The [developer and research guide](DEVELOPER_GUIDE.md) covers:
 - dataset preparation and model training;
 - papers and citation information.
 
+Active engineering investigations:
+
+- [LADSPA overload recovery report](LADSPA_OVERLOAD_REPORT.md) — field evidence,
+  source analysis, and a regression-test plan for real-time callback stalls.
+
 ## Downloads
 
 - [Latest DeepFilterNet Plus release](https://github.com/ismailivanov/DeepFilterNetPlus/releases/latest)
