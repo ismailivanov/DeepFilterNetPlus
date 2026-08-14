@@ -44,8 +44,9 @@ fn run_quantum(
         .collect();
     let out_ports: Vec<PortConnection> = out_bufs
         .iter_mut()
-        .map(|b| PortConnection {
-            port: desc.ports[ch],
+        .enumerate()
+        .map(|(i, b)| PortConnection {
+            port: desc.ports[ch + i],
             data: PortData::AudioOutput(RefCell::new(b)),
         })
         .collect();
