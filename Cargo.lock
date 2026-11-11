@@ -1101,7 +1101,7 @@ dependencies = [
 
 [[package]]
 name = "deep_filter"
-version = "0.5.7-pre"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
