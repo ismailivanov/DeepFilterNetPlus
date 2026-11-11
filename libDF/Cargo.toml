@@ -1,10 +1,10 @@
 [package]
-name = "deep_filter"
-version = "0.5.7-pre"
-authors = ["Hendrik Schröter"]
-edition = "2021"
+name = "DeepFilterNetPlus"
+version = "1.0.2"
+authors = ["Hendrik Schröter", "ismailivanov"]
+edition = "2026"
 description = "Noise supression using deep filtering"
-repository = "https://github.com/Rikorose/DeepFilterNet"
+repository = "https://github.com/ismailivanov/DeepFilterNetPlus"
 license = "MIT/Apache-2.0"
 readme = "../README.md"
 rust-version = "1.70"
